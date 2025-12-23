@@ -1,0 +1,412 @@
+---
+title: "Flow TexRad DL GAN32 Feature Fusion"
+author: "P R Barber, M Tharmakulasingam"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggfortify)
+library(msaWrapper)
+library(pROC)
+library(glmnet)
+```
+
+# Introduction
+
+This follows on from TestSetExtraction.Rmd
+
+# Load Data
+
+```{r}
+# The Risk signature file now (July 2025) contains 2 signatures
+readRiskSIgnature <- function(sigFile){
+    lines <- readLines(sigFile)
+  
+  # Find the line number containing the target string for the non-spurious version
+  start_line <- grep("non-spurious covariates only", lines)[1]  # [1] ensures the first match
+  
+  relevant_lines <- lines[start_line:length(lines)]
+  
+  # Write the relevant lines to a temporary file
+  temp_file <- tempfile()
+  writeLines(relevant_lines, temp_file)
+  
+  # Read the table from the temporary file
+  riskSignatureDataframe <- read.table(temp_file,
+                                       sep = '*', col.names = c("Weight", "Covariate"),
+                                       stringsAsFactors = F, skip = 1, fill = T)
+  
+  # Clean up the temporary file
+  unlink(temp_file)
+  
+  riskSignatureDataframe
+}
+
+# Select features from the uni-modal signatures
+flow_selected <- as.vector(readRiskSIgnature(paste0("../flow/flow/", Sps_regression_folder, "/RiskScore_formula.txt"))[,2])
+texrad_selected <- as.vector(readRiskSIgnature(paste0("../texrad/texrad/", Sps_regression_folder, "/RiskScore_formula.txt"))[,2])
+dl_selected <- as.vector(readRiskSIgnature(paste0("../dl_GAN32/dl/", Sps_regression_folder, "/RiskScore_formula.txt"))[,2])
+
+# last element of each feature list is the constant
+flow_selected <- flow_selected[-length(flow_selected)]
+texrad_selected <- texrad_selected[-length(texrad_selected)]
+dl_selected <- dl_selected[-length(dl_selected)]
+
+flow_train <- read.csv("../train_flow.csv")[, c("ID", flow_selected)]
+flow_test <- read.csv("../test_flow.csv")[, c("ID", flow_selected)]
+texrad_train <- read.csv("../train_texrad.csv")[, c("ID", texrad_selected)]
+texrad_test <- read.csv("../test_texrad.csv")[, c("ID", texrad_selected)]
+dl_train <- read.csv("../train_dl.csv")[, c("ID", dl_selected)]
+dl_test <- read.csv("../test_dl.csv")[, c("ID", dl_selected)]
+
+data_namecv <- "flow_texrad_dl_features"
+
+outcome_train <- read.csv("../train_outcomes.csv")
+outcome_test <- read.csv("../test_outcomes.csv")
+
+# Some rows are now missing from the outcomes since other cancers were excluded.
+# AND we must be sure the sample order is the same throughout
+# For all data types
+merged_train <- merge(flow_train, outcome_train, by = "ID")
+merged_test <- merge(flow_test, outcome_test, by = "ID")
+flow_train <- subset(merged_train, select = -CancerDx)
+flow_test <- subset(merged_test, select = -CancerDx)
+
+merged_train <- merge(texrad_train, outcome_train, by = "ID")
+merged_test <- merge(texrad_test, outcome_test, by = "ID")
+texrad_train <- subset(merged_train, select = -CancerDx)
+texrad_test <- subset(merged_test, select = -CancerDx)
+
+merged_train <- merge(dl_train, outcome_train, by = "ID")
+merged_test <- merge(dl_test, outcome_test, by = "ID")
+dl_train <- subset(merged_train, select = -CancerDx)
+dl_test <- subset(merged_test, select = -CancerDx)
+
+
+# Form train and test sets, keep 1 ID col, remove the other ID cols
+train_set <- cbind(flow_train, texrad_train[, -1], dl_train[, -1])
+test_set <- cbind(flow_test, texrad_test[, -1], dl_test[, -1])
+
+groups <- c(rep(1, ncol(flow_train)-1), rep(2, ncol(texrad_train)-1), rep(3, ncol(dl_train)-1))
+group_names <- c("flow", "texrad", "dl")
+
+train_msa <- msaWrapperCreate(train_set, outcome_train$CancerDx, rowsLabelled = T, group = groups, groupLabels = group_names)
+test_msa <- msaWrapperCreate(test_set, outcome_test$CancerDx, rowsLabelled = T, group = groups, groupLabels = group_names)
+
+```
+
+# Data Reduction
+
+No need, only a few covariates.
+
+```{r}
+#train_msa <- reduceByCorrelationWithinGroups(train_msa, threshold = 0.7)
+saveRDS(train_msa, file = paste0(data_namecv, "_train_msa_reduced.Rds"))
+```
+
+```{r}
+train_msa <- readRDS(paste0(data_namecv, "_train_msa_reduced.Rds"))
+train_msa
+train_msa$colLabels
+```
+
+# Train
+
+Can take a long time, maybe run separately.
+
+```{r}
+if(!file.exists(paste0(data_namecv, "_SPS_model.Rds"))){
+  
+  SPS_model_cv <- buildSPSignature(train_msa, data_namecv, iterations = Sps_iterations,                                    inifile = Sps_ini_file_template)
+  
+  saveRDS(SPS_model_cv, file = paste0(data_namecv, "_SPS_model.Rds"))
+  file.rename("SPS_Signature_logfile.txt", paste0(data_namecv, "_SPS_Signature_logfile.txt"))
+  
+  # save train and test data in sps format for manual testing
+  df <- train_msa$data
+  df <- df[, order(colnames(df))] # order cols so train ans test match
+  df$outcome = train_msa$outcome # add outcome, row order should be guaranteed
+  export_SPS_file(df,
+                  paste0("SPS_data_", data_namecv, "_train"),
+                  type = 4,  # 4: ordinal class outcome data without sample IDs
+                  C = 2)
+  
+  df <- test_msa$data[, colnames(test_msa$data) %in% colnames(train_msa$data)]
+  df <- df[, order(colnames(df))] # order cols so train ans test match
+  df$outcome = test_msa$outcome # add outcome, row order should be guaranteed
+  export_SPS_file(df,
+                  paste0("SPS_data_", data_namecv, "_test"),
+                  type = 4,  # 4: ordinal class outcome data without sample IDs
+                  C = 2)
+  
+  # ID = train_msa$rowLabels, but data reduction does not keep the row labels
+}
+```
+
+```{r}
+SPS_model <- readRDS(paste0(data_namecv, "_SPS_model.Rds"))
+```
+
+Check Train Performance
+
+```{r}
+data_name <- data_namecv
+plotSPSignatureBetaSwimmers(SPS_model, show_best_performance_line = F, selectedSig = FALSE, textreducescale = 2)
+plotSPSignatureOClass(SPS_model)
+
+tiff(paste0("plotSPSignatureBetaSwimmers", ".tiff"), compression = "lzw", res = 600, width = 4000, height = 4000)
+plotSPSignatureBetaSwimmers(SPS_model, show_best_performance_line = F, selectedSig = FALSE, textreducescale = 2)
+dev.off()
+
+tiff(paste0("plotSPSignatureOClass_train_box", ".tiff"), compression = "lzw", res = 600, width = 4000, height = 4000)
+plotSPSignatureOClass(SPS_model)
+dev.off()
+
+```
+
+```{r}
+try(plotBetaTable(paste0(data_namecv, "/", Sps_regression_folder, "/"), cex = 0.7, rowspacing = 0.05, xmin = -2.5, betapos = 1.8, pvaluepos = 2.6,rankpos = 3.1,weightpos = 3.2, xmax = 3.2, useRank = TRUE))
+
+tiff(paste0("plotBetaTable", ".tiff"), compression = "lzw", res = 600, width = 4000, height = 4000)
+try(plotBetaTable(paste0(data_namecv, "/", Sps_regression_folder, "/"), cex = 0.7, rowspacing = 0.05, xmin = -2.5, betapos = 1.8, pvaluepos = 2.6,rankpos = 3.1,weightpos = 3.2, xmax = 3.2, useRank = TRUE))
+dev.off()
+
+```
+
+## Get train Score and Signatures
+
+```{r}
+try(trainresultscv <- predictSPSignature(train_msa$data, data_namecv, Sps_regression_folder)) # will use trainresultscv as a flag for model exists
+
+if(exists("trainresultscv")){
+traingAUC <- getSPSignaturePerformance(trainresultscv, as.numeric(train_msa$outcome))
+
+tiff(paste0("getSPSignaturePerformance_train_ROC", ".tiff"), compression = "lzw", res = 600, width = 4000, height = 4000)
+getSPSignaturePerformance(trainresultscv, as.numeric(train_msa$outcome))
+dev.off()
+
+getSignatures(data_namecv, Sps_regression_folder)
+
+getNormalisedSignatures(data_namecv, Sps_regression_folder)
+}
+```
+
+```{r}
+if(exists("trainresultscv")){
+SPS_train_AUC_ci <- ci.auc(train_msa$outcome, trainresultscv)
+cat(paste("Training AUC:", round(SPS_train_AUC_ci[2], digits = 2), "(", round(SPS_train_AUC_ci[1], digits = 2), "-", round(SPS_train_AUC_ci[3], digits = 2), ")"))
+} else {SPS_train_AUC_ci = c(0, 0, 0)}
+```
+
+# Test set performance
+
+## Get test set outcomes
+
+```{r warning=FALSE}
+  try(testresultscv <- predictSPSignature(test_msa$data, data_namecv, Sps_regression_folder))
+  
+if(exists("testresultscv")){
+
+testAUC <- getSPSignaturePerformance(testresultscv, as.numeric(test_msa$outcome))
+
+tiff(paste0("getSPSignaturePerformance_test_ROC", ".tiff"), compression = "lzw", res = 600, width = 4000, height = 4000)
+getSPSignaturePerformance(testresultscv, as.numeric(test_msa$outcome))  # only makes tiff of the last plot
+dev.off()
+
+# get a tiff of the box plot
+data <- data.frame(testresultscv, as.numeric(test_msa$outcome))
+names(data) <- c("RiskScore", "Class")
+data$Class <- as.factor(data$Class)
+t.test_result <- t.test(RiskScore ~ Class, data = data)
+p_value <- sapply(t.test_result$p.value, JNCI_pvals)
+tiff(paste0("getSPSignaturePerformance_test_box", ".tiff"), compression = "lzw", res = 600, width = 4000, height = 4000)
+ggplot(data, aes(x = Class, y = RiskScore, group = Class)) + 
+        geom_boxplot(outlier.colour = NA) + geom_jitter(width = 0.2, 
+        col = rgb(0.1, 0.2, 0.8, 0.3)) + theme_classic() + labs(title = paste("p-value", 
+        p_value))
+dev.off()
+}
+```
+
+```{r}
+if(exists("trainresultscv")){
+SPS_test_AUC_ci <- ci.auc(test_msa$outcome, testresultscv)
+cat(paste("Testing AUC:", round(SPS_test_AUC_ci[2], digits = 2), "(", round(SPS_test_AUC_ci[1], digits = 2), "-", round(SPS_test_AUC_ci[3], digits = 2), ")"))
+} else {SPS_test_AUC_ci = c(0, 0, 0)}
+```
+
+# ElasNet Model (Lasso) Analysis
+
+For this type of fusion we should get the selected features from the LASSO saved set.
+
+```{r}
+# This code is largely the same as above but now for lasso
+
+# get selected covar lists from saved models
+load("../flow/flow_ElsticNet_Lasso_model.rda")
+#flow_selected <- ElasNet_model$strict_covars[-1]
+flow_selected <- ElasNet_model$optimal_covars[-1]    # Strict did not work?
+
+load("../texrad/texrad_ElsticNet_Lasso_model.rda")
+texrad_selected <- ElasNet_model$strict_covars[-1]
+
+load("../dl_GAN32/dl_ElsticNet_Lasso_model.rda")
+dl_selected <- ElasNet_model$strict_covars[-1]
+
+rm(ElasNet_model)  # for safety as saved ones have the same name as here
+
+# load files and select the required covars here
+flow_train <- read.csv("../train_flow.csv")[, c("ID", flow_selected)]
+flow_test <- read.csv("../test_flow.csv")[, c("ID", flow_selected)]
+texrad_train <- read.csv("../train_texrad.csv")[, c("ID", texrad_selected)]
+texrad_test <- read.csv("../test_texrad.csv")[, c("ID", texrad_selected)]
+dl_train <- read.csv("../train_dl.csv")[, c("ID", dl_selected)]
+dl_test <- read.csv("../test_dl.csv")[, c("ID", dl_selected)]
+
+data_namecv <- "flow_texrad_dl_features"
+
+outcome_train <- read.csv("../train_outcomes.csv")
+outcome_test <- read.csv("../test_outcomes.csv")
+
+# Some rows are now missing from the outcomes since other cancers were excluded.
+# AND we must be sure the sample order is the same throughout
+# For all data types
+if(length(flow_selected) > 0){
+  merged_train <- merge(flow_train, outcome_train, by = "ID")
+  merged_test <- merge(flow_test, outcome_test, by = "ID")
+  flow_train <- subset(merged_train, select = -CancerDx)
+  flow_test <- subset(merged_test, select = -CancerDx)
+}else{   # if no covars selected, just make a data frame of IDs
+  flow_train <- data.frame(ID = flow_train)
+  flow_test <- data.frame(ID = flow_test)
+}
+
+if(length(texrad_selected) > 0){
+  merged_train <- merge(texrad_train, outcome_train, by = "ID")
+  merged_test <- merge(texrad_test, outcome_test, by = "ID")
+  texrad_train <- subset(merged_train, select = -CancerDx)
+  texrad_test <- subset(merged_test, select = -CancerDx)
+}else{
+  texrad_train <- data.frame(ID = texrad_train)
+  texrad_test <- data.frame(ID = texrad_test)
+}
+
+if(length(dl_selected) > 0){
+  merged_train <- merge(dl_train, outcome_train, by = "ID")
+  merged_test <- merge(dl_test, outcome_test, by = "ID")
+  dl_train <- subset(merged_train, select = -CancerDx)
+  dl_test <- subset(merged_test, select = -CancerDx)
+}else{
+  dl_train <- data.frame(ID = dl_train)
+  dl_test <- data.frame(ID = dl_test)
+}
+
+# Form train and test sets, keep 1 ID col, remove the other ID cols
+train_set <- cbind(flow_train, texrad_train[, -1], dl_train[, -1])
+test_set <- cbind(flow_test, texrad_test[, -1], dl_test[, -1])
+
+# If any mode has 1 or less covars, names will be wrong, reset them here
+names(train_set) <- c("ID", flow_selected, texrad_selected, dl_selected)
+names(test_set) <- c("ID", flow_selected, texrad_selected, dl_selected)
+
+# Error here because no flow selected
+groups <- c(rep(1, ncol(flow_train)-1), rep(2, ncol(texrad_train)-1), rep(3, ncol(dl_train)-1))
+group_names <- c("flow", "texrad", "dl")
+#groups <- c(rep(1, ncol(texrad_train)-1), rep(2, ncol(dl_train)-1))
+#group_names <- c("texrad", "dl")
+
+train_msa <- msaWrapperCreate(train_set, outcome_train$CancerDx, rowsLabelled = T, group = groups, groupLabels = group_names)
+test_msa <- msaWrapperCreate(test_set, outcome_test$CancerDx, rowsLabelled = T, group = groups, groupLabels = group_names)
+
+```
+
+Training the ElasticNet model. alpha=1 (lasso) is used as there are many features and lasso tends to perform better on data with larger features.
+
+```{r warning=FALSE}
+if(!file.exists(paste0(data_namecv, "_ElsticNet_Lasso_model.rda"))){
+  ElasNet_model <-buildElasticNet(train_msa, iterations = Enet_iterations, alpha = 1)
+  save(ElasNet_model, file=paste0(data_namecv, "_ElsticNet_Lasso_model.rda"))
+}
+```
+
+```{r warning=FALSE}
+Elasnetfilename <- paste0(data_namecv, "_ElsticNet_Lasso_model.rda")
+load(Elasnetfilename)
+plotElasticNetCoefs(ElasNet_model, xvar = "lambda", selectedSig=TRUE)
+plotElasticNetCoefs(ElasNet_model, xvar = "lambda")
+plotElasticNetPerformance(ElasNet_model)
+
+print('Train with strict Lambda')
+try(trainbestAUC <- getElasticNetPerformance(ElasNet_model$strict_Predicted_risk, as.numeric(train_msa$outcome)))
+
+print('Sigantures- strict Lambda')
+try(si <- getElasNetSignatures(ElasNet_model, is_optimal_signature=FALSE))
+print(si)
+
+try(strict_Predicted_response <- predictElasticNet(ElasNet_model, test_set[, train_msa$colLabels], 
+                                             lambda = ElasNet_model$strict_lambda))
+print('Test with strict Lambda')
+try(testbestAUC <- getElasticNetPerformance(strict_Predicted_response, as.numeric(test_msa$outcome)))
+
+```
+
+```{r}
+EN_train_AUC_ci <- ci.auc(train_msa$outcome, ElasNet_model$strict_Predicted_risk)
+cat(paste("Training AUC:", round(EN_train_AUC_ci[2], digits = 2), "(", round(EN_train_AUC_ci[1], digits = 2), "-", round(EN_train_AUC_ci[3], digits = 2), ")"))
+
+EN_test_AUC_ci <- ci.auc(test_msa$outcome, strict_Predicted_response)
+cat(paste("Testing AUC:", round(EN_test_AUC_ci[2], digits = 2), "(", round(EN_test_AUC_ci[1], digits = 2), "-", round(EN_test_AUC_ci[3], digits = 2), ")"))
+```
+
+# Save AUCs
+
+```{r}
+auc_results <- data.frame(rbind(SPS_train_AUC_ci, SPS_test_AUC_ci, EN_train_AUC_ci, EN_test_AUC_ci))
+colnames(auc_results) <- c("ci_lower", "AUC", "ci_upper")
+write.csv(auc_results, file=paste0(data_namecv, "_AUC_results.csv"), row.names = T)
+```
+
+# Directory to save the EPS files
+output_dir <- "D:/Lung EDx/Experiments_Starting23072024 Rami New sets/flow_texrad_dl_GAN32_features"
+
+library(ggplot2)
+library(msaWrapper)
+library(strex)
+
+plotSPSignatureOClass_custom <- function(SPSig, output_dir) {
+    stopifnot(class(SPSig) == "msaWrapperSPSignatureOclass")
+    title <- SPSig$runName
+    data.name <- SPSig$runName
+    data.folder <- paste0(data.name, "/")
+    results.folder <- paste0(data.folder, SPSig$regressionFolder, "/")
+    risk.file <- paste0(results.folder, "RiskScoreDataset_ordinal_reg2.dat")
+    N <- strex::str_last_number(grep("N=", readLines(risk.file), value = TRUE), decimals = F)
+    data <- read.delim(risk.file, sep = " ", skip = 3, header = F, nrows = N)
+    if (ncol(data) == 3) {
+        names(data) = c("ID", "RiskScore", "Class")
+    }
+    else {
+        names(data) = c("RiskScore", "Class")
+    }
+    t.test_result <- t.test(data$RiskScore ~ data$Class)
+    p_value <- sapply(t.test_result$p.value, JNCI_pvals)
+    print(cor.test(data$RiskScore, data$Class, method = "kendall"))
+    data$Class <- as.factor(data$Class)
+    ggp <- ggplot(data, aes(x = Class, y = RiskScore, group = Class)) + 
+        geom_boxplot(outlier.colour = NA) + geom_jitter(width = 0.2, col = rgb(0.1, 0.2, 0.8, 0.3)) + 
+        theme_classic() + labs(title = paste("p-value", p_value))
+    
+    # Save the plot as EPS
+    setEPS()
+    postscript(file = paste0(output_dir, "/", data.name, "_SPS_Signature_OClass.eps"))
+    print(ggp)
+    dev.off()
+}
+
+# Example usage:
+# Assuming SPS_model is already loaded and properly created
+# plotSPSignatureOClass_custom(SPS_model, output_dir)
+
+

@@ -1,0 +1,132 @@
+---
+title: "Overall Results (GAN32)"
+author: "P R Barber"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(forestplot)
+library(dplyr)
+library(strex)
+```
+
+Some plots of overall results from all modalities.
+
+# Unimodal + All combined
+
+```{r main_results, eval=FALSE}
+
+# Use this for main results
+
+d <- data.frame()
+d <- rbind(d, read.csv("flow/flow_AUC_results.csv"))
+d <- rbind(d, read.csv("texrad/texrad_AUC_results.csv"))
+d <- rbind(d, read.csv("dl_GAN32/dl_AUC_results.csv"))
+d <- rbind(d, read.csv("flow_texrad_dl_GAN32/flow_texrad_dl_AUC_results.csv"))
+d <- rbind(d, read.csv("flow_texrad_dl_GAN32_features/flow_texrad_dl_features_AUC_results.csv"))
+d <- rbind(d, read.csv("flow_texrad_dl_GAN32_signatures/flow_texrad_dl_sigs_AUC_results.csv"))
+
+#d$modality <- as.factor(rep(c("flow", "texrad", "dl", 
+#                              "flow_texrad_dl", 
+#                              "flow_texrad_dl_feat", 
+#                              "flow_texrad_dl_meta"), each = 4))
+
+d$modality <- as.factor(rep(c("Immune", "CT TexRAD", "CT DL", 
+                              "All Combined", "All Combined", "All Combined"), each = 4))
+d$covariate <- as.factor(rep(c("signature", "signature", "signature", 
+                              "early fusion", 
+                              "int. fusion", 
+                              "late fusion"), each = 4))
+
+d$method <- as.factor(str_before_first(d$X, "_"))
+d$dataset <- as.factor(str_before_first(str_after_first(d$X, "_"), "_"))
+
+```
+
+```{r includeFLowAnd, eval=TRUE}
+
+# Use this to include flow+texrad and flow+dl
+
+d <- data.frame()
+d <- rbind(d, read.csv("flow/flow_AUC_results.csv"))
+d <- rbind(d, read.csv("texrad/texrad_AUC_results.csv"))
+d <- rbind(d, read.csv("dl_GAN32/dl_AUC_results.csv"))
+d <- rbind(d, read.csv("flow_texrad/flow_texrad_AUC_results.csv"))
+d <- rbind(d, read.csv("flow_dl_GAN32/flow_dl_AUC_results.csv"))
+d <- rbind(d, read.csv("flow_texrad_dl_GAN32/flow_texrad_dl_AUC_results.csv"))
+d <- rbind(d, read.csv("flow_texrad_dl_GAN32_features/flow_texrad_dl_features_AUC_results.csv"))
+d <- rbind(d, read.csv("flow_texrad_dl_GAN32_signatures/flow_texrad_dl_sigs_AUC_results.csv"))
+
+#d$modality <- as.factor(rep(c("flow", "texrad", "dl", 
+#                              "flow_texrad_dl", 
+#                              "flow_texrad_dl_feat", 
+#                              "flow_texrad_dl_meta"), each = 4))
+
+d$modality <- as.factor(rep(c("Immune", "CT TexRAD", "CT DL", "Imm.TexRAD", "Imm.DL",
+                              "All Combined", "All Combined", "All Combined"), each = 4))
+d$covariate <- as.factor(rep(c("signature", "signature", "signature", 
+                               "early fusion", "early fusion",
+                              "early fusion", 
+                              "int. fusion", 
+                              "late fusion"), each = 4))
+
+d$method <- as.factor(str_before_first(d$X, "_"))
+d$dataset <- as.factor(str_before_first(str_after_first(d$X, "_"), "_"))
+
+```
+
+```{r}
+# The author of forestplot like to use the R pipe |> into the first arg
+# and dplyr
+
+# NB you cannot have AUC values as a column and have group_by for multiple points per line!
+
+d |>
+  filter(method == "SPS") |>
+  group_by(dataset) |>
+  forestplot(labeltext = c(modality, covariate),
+             mean = AUC,
+             lower = ci_lower,
+             upper = ci_upper,
+             vertices = TRUE, 
+             boxsize = 0.2, 
+             xlab = "AUC",
+             title = "Saddle Point Signature (GAN32)",
+             zero = NA,
+             xticks = c(0.5, 0.6, 0.7, 0.8, 0.9, 1.0)) |>
+  fp_add_header(modality = "Modality", covariate = "Covariate") |> 
+  fp_set_style(box = c("#7570b3", "#d95f02")) |> 
+  fp_set_zebra_style("#E5E9E9") |> 
+  fp_decorate_graph(grid = structure(c(0.5, 0.6, 0.7, 0.8, 0.9, 1.0), 
+                              gp = gpar(lty = 2, col = "#CCCCFF")))
+
+```
+
+```{r}
+
+d |>
+  filter(method == "EN") |>
+  group_by(dataset) |>
+  forestplot(labeltext = c(modality, covariate),
+             mean = AUC,
+             lower = ci_lower,
+             upper = ci_upper,
+             vertices = TRUE, 
+             boxsize = 0.2, 
+             xlab = "AUC",
+             title = "Elastic Net (GAN32)",
+             zero = NA,
+             xticks = c(0.5, 0.6, 0.7, 0.8, 0.9, 1.0)) |>
+  fp_add_header(modality = "Modality", covariate = "Covariate") |> 
+  fp_set_style(box = c("#7570b3", "#d95f02")) |> 
+  fp_set_zebra_style("#E5E9E9") |> 
+  fp_decorate_graph(grid = structure(c(0.5, 0.6, 0.7, 0.8, 0.9, 1.0), 
+                              gp = gpar(lty = 2, col = "#CCCCFF")))
+
+```
+
+
+

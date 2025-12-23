@@ -1,0 +1,226 @@
+---
+title: "Flow Cytometry"
+author: "P R Barber, M Tharmakulasingam"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggfortify)
+library(msaWrapper)
+library(pROC)
+library(glmnet)
+```
+
+# Introduction
+
+This follows on from TestSetExtraction.Rmd
+
+# Load Data
+
+```{r}
+flow_train <- read.csv("../train_flow.csv")
+flow_test <- read.csv("../test_flow.csv")
+
+data_namecv <- "flow"
+
+outcome_train <- read.csv("../train_outcomes.csv")
+outcome_test <- read.csv("../test_outcomes.csv")
+
+# Some rows are now missing from the outcomes since other cancers were excluded.
+# AND we must be sure the sample order is the same throughout
+merged_train <- merge(flow_train, outcome_train, by = "ID")
+merged_test <- merge(flow_test, outcome_test, by = "ID")
+
+train_msa <- msaWrapperCreate(subset(merged_train, select = -CancerDx), merged_train$CancerDx, rowsLabelled = T)
+test_msa <- msaWrapperCreate(subset(merged_test, select = -CancerDx), merged_test$CancerDx, rowsLabelled = T)
+
+test_set <- subset(merged_test, select = -CancerDx)
+```
+
+# Data Reduction
+
+```{r}
+train_msa <- reduceByCorrelationWithinGroups(train_msa, threshold = 0.7)
+saveRDS(train_msa, file = paste0(data_namecv, "_train_msa_reduced.Rds"))
+```
+
+```{r}
+train_msa <- readRDS(paste0(data_namecv, "_train_msa_reduced.Rds"))
+train_msa
+train_msa$colLabels
+```
+
+# Train
+
+Can take a long time, maybe run separately.
+
+```{r}
+if(!file.exists(paste0(data_namecv, "_SPS_model.Rds"))){
+  
+  SPS_model_cv <- buildSPSignature(train_msa, data_namecv, iterations = Sps_iterations,                                    inifile = Sps_ini_file_template)
+  
+  saveRDS(SPS_model_cv, file = paste0(data_namecv, "_SPS_model.Rds"))
+  file.rename("SPS_Signature_logfile.txt", paste0(data_namecv, "_SPS_Signature_logfile.txt"))
+  
+  # save train and test data in sps format for manual testing
+  df <- train_msa$data
+  df <- df[, order(colnames(df))] # order cols so train ans test match
+  df$outcome = train_msa$outcome # add outcome, row order should be guaranteed
+  export_SPS_file(df,
+                  paste0("SPS_data_", data_namecv, "_train"),
+                  type = 4,  # 4: ordinal class outcome data without sample IDs
+                  C = 2)
+  
+  df <- test_msa$data[, colnames(test_msa$data) %in% colnames(train_msa$data)]
+  df <- df[, order(colnames(df))] # order cols so train ans test match
+  df$outcome = test_msa$outcome # add outcome, row order should be guaranteed
+  export_SPS_file(df,
+                  paste0("SPS_data_", data_namecv, "_test"),
+                  type = 4,  # 4: ordinal class outcome data without sample IDs
+                  C = 2)
+  
+  # ID = train_msa$rowLabels, but data reduction does not keep the row labels
+}
+```
+
+```{r}
+SPS_model <- readRDS(paste0(data_namecv, "_SPS_model.Rds"))
+```
+
+Check Train Performance
+
+```{r}
+data_name <- data_namecv
+plotSPSignatureBetaSwimmers(SPS_model, show_best_performance_line = F, selectedSig = FALSE, textreducescale = 2)
+plotSPSignatureOClass(SPS_model)
+
+tiff(paste0("plotSPSignatureBetaSwimmers", ".tiff"), compression = "lzw", res = 600, width = 4000, height = 4000)
+plotSPSignatureBetaSwimmers(SPS_model, show_best_performance_line = F, selectedSig = FALSE, textreducescale = 2)
+dev.off()
+
+tiff(paste0("plotSPSignatureOClass_train_box", ".tiff"), compression = "lzw", res = 600, width = 4000, height = 4000)
+plotSPSignatureOClass(SPS_model)
+dev.off()
+
+```
+
+```{r}
+try(plotBetaTable(paste0(data_namecv, "/", Sps_regression_folder, "/"), cex = 0.7, rowspacing = 0.05, xmin = -2.5, betapos = 1.8, pvaluepos = 2.6,rankpos = 3.1,weightpos = 3.2, xmax = 3.2, useRank = TRUE))
+
+tiff(paste0("plotBetaTable", ".tiff"), compression = "lzw", res = 600, width = 4000, height = 4000)
+try(plotBetaTable(paste0(data_namecv, "/", Sps_regression_folder, "/"), cex = 0.7, rowspacing = 0.05, xmin = -2.5, betapos = 1.8, pvaluepos = 2.6,rankpos = 3.1,weightpos = 3.2, xmax = 3.2, useRank = TRUE))
+dev.off()
+
+```
+
+## Get train Score and Signatures
+
+```{r}
+try(trainresultscv <- predictSPSignature(train_msa$data, data_namecv, Sps_regression_folder)) # will use trainresultscv as a flag for model exists
+
+if(exists("trainresultscv")){
+traingAUC <- getSPSignaturePerformance(trainresultscv, as.numeric(train_msa$outcome))
+
+tiff(paste0("getSPSignaturePerformance_train_ROC", ".tiff"), compression = "lzw", res = 600, width = 4000, height = 4000)
+getSPSignaturePerformance(trainresultscv, as.numeric(train_msa$outcome))
+dev.off()
+
+getSignatures(data_namecv, Sps_regression_folder)
+
+getNormalisedSignatures(data_namecv, Sps_regression_folder)
+}
+```
+
+```{r}
+if(exists("trainresultscv")){
+SPS_train_AUC_ci <- ci.auc(train_msa$outcome, trainresultscv)
+cat(paste("Training AUC:", round(SPS_train_AUC_ci[2], digits = 2), "(", round(SPS_train_AUC_ci[1], digits = 2), "-", round(SPS_train_AUC_ci[3], digits = 2), ")"))
+} else {SPS_train_AUC_ci = c(0, 0, 0)}
+```
+
+# Test set performance
+
+## Get test set outcomes
+
+```{r warning=FALSE}
+  try(testresultscv <- predictSPSignature(test_msa$data, data_namecv, Sps_regression_folder))
+  
+if(exists("testresultscv")){
+
+testAUC <- getSPSignaturePerformance(testresultscv, as.numeric(test_msa$outcome))
+
+tiff(paste0("getSPSignaturePerformance_test_ROC", ".tiff"), compression = "lzw", res = 600, width = 4000, height = 4000)
+getSPSignaturePerformance(testresultscv, as.numeric(test_msa$outcome))  # only makes tiff of the last plot
+dev.off()
+
+# get a tiff of the box plot
+data <- data.frame(testresultscv, as.numeric(test_msa$outcome))
+names(data) <- c("RiskScore", "Class")
+data$Class <- as.factor(data$Class)
+t.test_result <- t.test(RiskScore ~ Class, data = data)
+p_value <- sapply(t.test_result$p.value, JNCI_pvals)
+tiff(paste0("getSPSignaturePerformance_test_box", ".tiff"), compression = "lzw", res = 600, width = 4000, height = 4000)
+ggplot(data, aes(x = Class, y = RiskScore, group = Class)) + 
+        geom_boxplot(outlier.colour = NA) + geom_jitter(width = 0.2, 
+        col = rgb(0.1, 0.2, 0.8, 0.3)) + theme_classic() + labs(title = paste("p-value", 
+        p_value))
+dev.off()
+}
+```
+
+```{r}
+if(exists("trainresultscv")){
+SPS_test_AUC_ci <- ci.auc(test_msa$outcome, testresultscv)
+cat(paste("Testing AUC:", round(SPS_test_AUC_ci[2], digits = 2), "(", round(SPS_test_AUC_ci[1], digits = 2), "-", round(SPS_test_AUC_ci[3], digits = 2), ")"))
+} else {SPS_test_AUC_ci = c(0, 0, 0)}
+```
+
+# ElasNet Model (Lasso) Analysis
+
+Training the ElasticNet model. alpha=1 (lasso) is used as there are many features and lasso tends to perform better on data with larger features.
+
+```{r warning=FALSE}
+if(!file.exists(paste0(data_namecv, "_ElsticNet_Lasso_model.rda"))){
+  ElasNet_model <-buildElasticNet(train_msa, iterations = Enet_iterations, alpha = 1)
+  save(ElasNet_model, file=paste0(data_namecv, "_ElsticNet_Lasso_model.rda"))
+}
+```
+
+```{r warning=FALSE}
+Elasnetfilename <-paste0(data_namecv, "_ElsticNet_Lasso_model.rda")
+load(Elasnetfilename)
+plotElasticNetCoefs(ElasNet_model, xvar = "lambda", selectedSig=TRUE)
+plotElasticNetCoefs(ElasNet_model, xvar = "lambda")
+plotElasticNetPerformance(ElasNet_model)
+
+print('Train with strict Lambda')
+try(trainbestAUC <- getElasticNetPerformance(ElasNet_model$strict_Predicted_risk, as.numeric(train_msa$outcome)))
+
+print('Sigantures- strict Lambda')
+try(si <- getElasNetSignatures(ElasNet_model, is_optimal_signature=TRUE))
+print(si)
+
+try(strict_Predicted_response <- predictElasticNet(ElasNet_model, test_set[, train_msa$colLabels], 
+                                             lambda = ElasNet_model$strict_lambda))
+print('Test with strict Lambda')
+try(testbestAUC <- getElasticNetPerformance(strict_Predicted_response, as.numeric(test_msa$outcome)))
+
+```
+
+```{r}
+EN_train_AUC_ci <- ci.auc(train_msa$outcome, ElasNet_model$strict_Predicted_risk)
+cat(paste("Training AUC:", round(EN_train_AUC_ci[2], digits = 2), "(", round(EN_train_AUC_ci[1], digits = 2), "-", round(EN_train_AUC_ci[3], digits = 2), ")"))
+
+EN_test_AUC_ci <- ci.auc(test_msa$outcome, strict_Predicted_response)
+cat(paste("Testing AUC:", round(EN_test_AUC_ci[2], digits = 2), "(", round(EN_test_AUC_ci[1], digits = 2), "-", round(EN_test_AUC_ci[3], digits = 2), ")"))
+```
+
+# Save AUCs
+
+```{r}
+auc_results <- data.frame(rbind(SPS_train_AUC_ci, SPS_test_AUC_ci, EN_train_AUC_ci, EN_test_AUC_ci))
+colnames(auc_results) <- c("ci_lower", "AUC", "ci_upper")
+write.csv(auc_results, file=paste0(data_namecv, "_AUC_results.csv"), row.names = T)
+```
